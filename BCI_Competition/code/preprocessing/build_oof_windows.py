@@ -22,15 +22,12 @@ Arrays:
   run      int64, run index within session
   fold     int64, train-session validation fold id; -1 for test session
   split    int64, 0 train-session windows / 2 official test-session windows
-  segment, window_start, window_stop, decision_sample, event
-  event_*  original annotation-event table used by causal event evaluation
+  segment  independent clean segment id within a run
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,7 +47,6 @@ STRIDE_SAMPLES = 125
 LOW_HZ = 8.0
 HIGH_HZ = 30.0
 FILTER_ORDER = 4
-SCHEMA_VERSION = "bnci2014001_causal_windows_v3"
 
 CLASS_TO_ID = {"left_hand": 1, "right_hand": 2, "feet": 3, "tongue": 4}
 CLASS_NAMES = ["idle", "left_hand", "right_hand", "feet", "tongue"]
@@ -58,7 +54,6 @@ CLASS_NAMES = ["idle", "left_hand", "right_hand", "feet", "tongue"]
 
 @dataclass(frozen=True)
 class TaskEvent:
-    event_id: int
     start: int
     stop: int
     label: int
@@ -76,7 +71,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subjects", nargs="+", default=["all"], help="subject ids or 'all'")
     parser.add_argument("--data-root", type=Path, default=DATA_ROOT)
     parser.add_argument("--output-file", type=Path, default=OUTPUT_FILE)
-    parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
@@ -111,7 +105,7 @@ def task_events(raw: mne.io.BaseRaw) -> list[TaskEvent]:
             continue
         start = int(round(float(onset_s) * SAMPLING_RATE))
         stop = int(round((float(onset_s) + float(duration_s)) * SAMPLING_RATE))
-        events.append(TaskEvent(event_id=len(events), start=start, stop=stop, label=CLASS_TO_ID[name], name=name))
+        events.append(TaskEvent(start=start, stop=stop, label=CLASS_TO_ID[name], name=name))
     return events
 
 
@@ -178,19 +172,19 @@ def overlap(a_start: int, a_stop: int, b_start: int, b_stop: int) -> bool:
     return a_start < b_stop and a_stop > b_start
 
 
-def event_at_decision(stop: int, events: list[TaskEvent]) -> TaskEvent | None:
-    """Return the annotation active when this causal window produces a decision."""
-    sample = stop - 1
-    active = [event for event in events if event.start <= sample < event.stop]
-    if len(active) > 1:
-        raise RuntimeError(f"overlapping task annotations at sample {sample}")
-    return None if not active else active[0]
+def label_window(start: int, stop: int, events: list[TaskEvent]) -> int | None:
+    """Keep only idle windows or windows fully contained in one MI event."""
+    overlapping = [event for event in events if overlap(start, stop, event.start, event.stop)]
+    if not overlapping:
+        return 0
+    contained = [event for event in overlapping if start >= event.start and stop <= event.stop]
+    return contained[0].label if len(contained) == 1 and len(overlapping) == 1 else None
 
 
 def build_run_windows(
     raw: mne.io.BaseRaw,
     trial_artifacts: list[tuple[int, int]] | None = None,
-) -> tuple[dict[str, np.ndarray], list[TaskEvent], dict]:
+) -> tuple[dict[str, np.ndarray], dict]:
     signal = eeg_data(raw)
     all_events = task_events(raw)
     artifacts = sorted(set([*artifact_intervals(raw), *(trial_artifacts or [])]))
@@ -201,40 +195,37 @@ def build_run_windows(
     segments = clean_segments(signal.shape[1], artifacts)
 
     # 保留原始 sample 位置和 segment 身份，避免删除坏片段后压缩时间轴。
-    values: dict[str, list] = {
-        "X": [], "y": [], "segment": [], "window_start": [], "window_stop": [],
-        "decision_sample": [], "event": [],
-    }
+    values: dict[str, list] = {"X": [], "y": [], "segment": []}
+    dropped_boundary = 0
     for segment_id, segment in enumerate(segments):
         filtered = causal_filter_segment(signal[:, segment.start : segment.stop])
         for local_start in range(0, filtered.shape[1] - WINDOW_SAMPLES + 1, STRIDE_SAMPLES):
             global_start = segment.start + local_start
             global_stop = global_start + WINDOW_SAMPLES
-            event = event_at_decision(global_stop, events)
+            label = label_window(global_start, global_stop, events)
+            if label is None:
+                dropped_boundary += 1
+                continue
             values["X"].append(filtered[:, local_start : local_start + WINDOW_SAMPLES])
-            values["y"].append(0 if event is None else event.label)
+            values["y"].append(label)
             values["segment"].append(segment_id)
-            values["window_start"].append(global_start)
-            values["window_stop"].append(global_stop)
-            values["decision_sample"].append(global_stop - 1)
-            values["event"].append(-1 if event is None else event.event_id)
 
     count = len(values["y"])
     arrays = {
         "X": np.stack(values["X"]).astype(np.float32) if count else np.empty((0, 22, WINDOW_SAMPLES), dtype=np.float32),
         **{
             key: np.asarray(values[key], dtype=np.int64)
-            for key in ("y", "segment", "window_start", "window_stop", "decision_sample", "event")
+            for key in ("y", "segment")
         },
     }
     info = {
         "segments": len(segments),
-        "task_events": len(all_events),
-        "excluded_events": len(all_events) - len(events),
+        "task_events": len(events),
         "artifacts": len(artifacts),
         "windows": count,
+        "dropped_boundary": dropped_boundary,
     }
-    return arrays, events, info
+    return arrays, info
 
 
 def build_dataset(subjects: list[int]) -> tuple[dict[str, np.ndarray], list[dict]]:
@@ -252,14 +243,6 @@ def build_dataset(subjects: list[int]) -> tuple[dict[str, np.ndarray], list[dict
         "fold": [],
         "split": [],
         "segment": [],
-        "window_start": [],
-        "window_stop": [],
-        "decision_sample": [],
-        "event": [],
-    }
-    event_arrays: dict[str, list[int]] = {
-        "event_subject": [], "event_session": [], "event_run": [], "event_id": [],
-        "event_label": [], "event_start": [], "event_stop": [],
     }
     records: list[dict] = []
 
@@ -273,7 +256,7 @@ def build_dataset(subjects: list[int]) -> tuple[dict[str, np.ndarray], list[dict
                 artifact_key = (session_id, run_index)
                 if artifact_key not in trial_artifacts:
                     raise RuntimeError(f"missing source artifact flags for subject {subject}, run {artifact_key}")
-                run_arrays, events, info = build_run_windows(raw, trial_artifacts[artifact_key])
+                run_arrays, info = build_run_windows(raw, trial_artifacts[artifact_key])
                 n = len(run_arrays["y"])
                 for key, value in run_arrays.items():
                     arrays[key].append(value)
@@ -282,14 +265,6 @@ def build_dataset(subjects: list[int]) -> tuple[dict[str, np.ndarray], list[dict
                 arrays["run"].append(np.full(n, run_index, dtype=np.int64))
                 arrays["fold"].append(np.full(n, run_index if is_train_session else -1, dtype=np.int64))
                 arrays["split"].append(np.full(n, split_id, dtype=np.int64))
-                for event in events:
-                    event_arrays["event_subject"].append(subject)
-                    event_arrays["event_session"].append(session_id)
-                    event_arrays["event_run"].append(run_index)
-                    event_arrays["event_id"].append(event.event_id)
-                    event_arrays["event_label"].append(event.label)
-                    event_arrays["event_start"].append(event.start)
-                    event_arrays["event_stop"].append(event.stop)
                 record = {
                     "subject": subject,
                     "session": session_name,
@@ -306,29 +281,8 @@ def build_dataset(subjects: list[int]) -> tuple[dict[str, np.ndarray], list[dict
         key: np.concatenate(value, axis=0) if key != "X" else np.concatenate(value, axis=0).astype(np.float32)
         for key, value in arrays.items()
     }
-    output.update({key: np.asarray(value, dtype=np.int64) for key, value in event_arrays.items()})
-    # 数据身份由受试者集合和全部生效预处理参数确定，不依赖本机路径。
-    dataset_config = {
-        "dataset": "BNCI2014001", "subjects": sorted(subjects), "schema_version": SCHEMA_VERSION,
-        "sampling_rate": SAMPLING_RATE, "window_samples": WINDOW_SAMPLES, "stride_samples": STRIDE_SAMPLES,
-        "low_hz": LOW_HZ, "high_hz": HIGH_HZ, "filter_order": FILTER_ORDER,
-        "label_rule": "annotation_at_window_stop_minus_one",
-        "artifact_rule": "source_mat_flag_removes_full_trial",
-    }
-    config_json = json.dumps(dataset_config, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    dataset_id = f"bnci2014001_{hashlib.sha256(config_json.encode('utf-8')).hexdigest()[:10]}"
-    output.update({
-        "dataset_id": np.asarray(dataset_id),
-        "dataset_config": np.asarray(config_json),
-        "schema_version": np.asarray(SCHEMA_VERSION),
-        "label_rule": np.asarray("annotation_at_window_stop_minus_one"),
-        "sampling_rate": np.asarray(SAMPLING_RATE, dtype=np.int64),
-        "window_samples": np.asarray(WINDOW_SAMPLES, dtype=np.int64),
-        "stride_samples": np.asarray(STRIDE_SAMPLES, dtype=np.int64),
-    })
     return output, records
-
-
+    # 数据身份由受试者集合和全部生效预处理参数确定，不依赖本机路径。
 def write_outputs(output_file: Path, arrays: dict[str, np.ndarray]) -> None:
     output_file.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output_file, **arrays)
@@ -338,8 +292,6 @@ def write_outputs(output_file: Path, arrays: dict[str, np.ndarray]) -> None:
 
 def main() -> None:
     args = parse_args()
-    if args.output_file.exists() and not args.overwrite:
-        raise FileExistsError(f"output exists; pass --overwrite to replace it: {args.output_file}")
     configure_data_cache(args.data_root)
     from moabb.datasets import BNCI2014_001
 
