@@ -9,3 +9,4 @@ results/figures/*
 results/tables/*
 !results/tables/.gitkeep
 __pycache__/
+.torch_cuda/
